@@ -1,0 +1,109 @@
+name: "Enrich Release Notes with ClickUp Links"
+description: "Fetches release notes by release ID, finds linked PRs, retrieves associated ClickUp tasks, and updates the release body."
+
+inputs:
+  github_token:
+    description: 'GITHUB_TOKEN or a repo scoped PAT'
+    default: ${{ github.token }}
+    required: false
+  release_number:
+    description: "Numeric ID of the release to enrich (e.g. 12345678)."
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # Required for github-script to access the repository content if needed
+    - name: Checkout (required by actions/github-script)
+      uses: actions/checkout@v4
+
+    - name: Enrich release notes
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          // Convert the input string to a number.
+          const releaseId = parseInt('${{ inputs.release_number }}', 10);
+          const { owner, repo } = context.repo;
+
+          // 1) Fetch the release object by ID.
+          const { data: release } = await github.rest.repos.getRelease({
+            owner,
+            repo,
+            release_id: releaseId
+          });
+
+          // 2) Pull out the body (text) of the release.
+          const body = release.body;
+          console.log(`🔍 Processing release: ${release.name} (ID: ${release.id})`);
+
+          // 3) Look for PR links in the existing release notes:
+          //    e.g. "https://github.com/org/repo/pull/123"
+          const prLinkRegex = /https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/g;
+          const prNumbers = [...new Set([...body.matchAll(prLinkRegex)].map(m => parseInt(m[1])))];
+
+          console.log(`🧾 Found ${prNumbers.length} unique PR(s): ${prNumbers.join(", ")}`);
+
+          // 4) For each PR, grab all the comments, look for lines like:
+          //    "Task linked: [CU-XXXXX My Task](https://app.clickup.com/t/CU-XXXXX)"
+          const prToTasksMap = {};
+
+          for (const pr of prNumbers) {
+            console.log(`\n➡️ Checking PR #${pr}`);
+            const { data: comments } = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number: pr
+            });
+
+            console.log(`💬 Found ${comments.length} comment(s) on PR #${pr}`);
+
+            const tasks = [];
+            for (const comment of comments) {
+              const lines = comment.body.split("\n");
+              for (const line of lines) {
+                const match = line.match(/^Task linked:\s+\[(.*)\]\((https:\/\/app\.clickup\.com\/t\/[\w\d]+)\)/);
+                if (match) {
+                  const label = match[1];  // e.g. "CU-868d03kjk Lease template editor"
+                  const url = match[2];
+                  tasks.push(`  - [${label}](${url})`);
+                  console.log(`🔗 Found ClickUp task: ${label} (${url})`);
+                }
+              }
+            }
+
+            if (tasks.length > 0) {
+              prToTasksMap[pr] = tasks.join("\n");
+              console.log(`✅ Associating ${tasks.length} task(s) with PR #${pr}`);
+            } else {
+              console.log(`🚫 No task links found in comments for PR #${pr}`);
+            }
+          }
+
+          // 5) Insert sub-bullets into the release notes
+          console.log(`\n🛠 Updating release notes...`);
+          const updatedBody = body.replace(
+            /^(\s*[*-] .+?https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+))/gm,
+            (match, fullLine, prStr) => {
+              const pr = parseInt(prStr);
+              const subBullets = prToTasksMap[pr];
+              if (subBullets) {
+                console.log(`📌 Inserting sub-bullets for PR #${pr}`);
+                return `${fullLine}\n${subBullets}`;
+              }
+              return match;
+            }
+          );
+
+          // 6) Only update if there's a change
+          if (updatedBody !== body) {
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              body: updatedBody,
+            });
+            console.log("🎉 Release notes updated with ClickUp links.");
+          } else {
+            console.log("🟰 No updates made to release notes.");
+          }
