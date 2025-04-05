@@ -37,12 +37,11 @@ runs:
               release_id: Number(releaseNumber),
             });
           } else {
-            // Otherwise, assume it's a tag
-            release = await github.rest.repos.getReleaseByTag({
+            const { data: releases } = await github.rest.repos.listReleases({
               owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag: releaseNumber,
+              repo: context.repo.repo
             });
+            release = releases.find(r => r.tag_name === releaseNumber);
           }
 
           // 2) Pull out the body (text) of the release.
