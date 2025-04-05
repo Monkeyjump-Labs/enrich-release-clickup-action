@@ -62,8 +62,8 @@ runs:
           for (const pr of prNumbers) {
             console.log(`\n➡️ Checking PR #${pr}`);
             const { data: comments } = await github.rest.issues.listComments({
-              owner,
-              repo,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
               issue_number: pr
             });
 
@@ -109,8 +109,8 @@ runs:
           // 6) Only update if there's a change
           if (updatedBody !== body) {
             await github.rest.repos.updateRelease({
-              owner,
-              repo,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
               release_id: release.id,
               body: updatedBody,
             });
