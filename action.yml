@@ -112,6 +112,9 @@ runs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               release_id: release.id,
+              tag_name: release.tag_name,
+              draft: release.draft,
+              prerelease: release.prerelease,
               body: updatedBody,
             });
             console.log("🎉 Release notes updated with ClickUp links.");
