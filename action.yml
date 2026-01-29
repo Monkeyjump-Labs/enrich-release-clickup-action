@@ -16,6 +16,8 @@ runs:
     # Required for github-script to access the repository content if needed
     - name: Checkout (required by actions/github-script)
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Enrich release notes
       uses: actions/github-script@v7
