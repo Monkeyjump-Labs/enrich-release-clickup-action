@@ -1,5 +1,5 @@
-name: "Enrich Release Notes with ClickUp Links"
-description: "Fetches release notes by release ID, finds linked PRs, retrieves associated ClickUp tasks, and updates the release body."
+name: 'Enrich Release Notes with ClickUp Links'
+description: 'Fetches release notes by release ID, finds linked PRs, retrieves associated ClickUp tasks, and updates the release body.'
 
 inputs:
   github_token:
@@ -11,7 +11,7 @@ inputs:
     required: true
 
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     # Required for github-script to access the repository content if needed
     - name: Checkout (required by actions/github-script)
