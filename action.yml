@@ -33,17 +33,26 @@ runs:
 
           // If purely numeric, treat it as a release ID
           if (/^\d+$/.test(releaseNumber)) {
-            release = await github.rest.repos.getRelease({
+            const { data } = await github.rest.repos.getRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
               release_id: Number(releaseNumber),
             });
+            release = data;
           } else {
-            const { data: releases } = await github.rest.repos.listReleases({
+            // Paginate so we search ALL releases, including drafts
+            // (getReleaseByTag does not return draft releases)
+            const releases = await github.paginate(github.rest.repos.listReleases, {
               owner: context.repo.owner,
-              repo: context.repo.repo
+              repo: context.repo.repo,
+              per_page: 100,
             });
             release = releases.find(r => r.tag_name === releaseNumber);
+          }
+
+          if (!release) {
+            core.setFailed(`❌ Release not found for ID or tag: ${releaseNumber}`);
+            return;
           }
 
           // 2) Pull out the body (text) of the release.
