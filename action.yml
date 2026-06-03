@@ -29,17 +29,23 @@ runs:
           const releaseNumber = process.env.RELEASE_NUMBER;
           console.log(`🔍 Attempting to fetch release by ID or Tag: ${releaseNumber}`);
 
-          let release;
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-          // If purely numeric, treat it as a release ID
-          if (/^\d+$/.test(releaseNumber)) {
-            const { data } = await github.rest.repos.getRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: Number(releaseNumber),
-            });
-            release = data;
-          } else {
+          const fetchRelease = async () => {
+            // If purely numeric, treat it as a release ID
+            if (/^\d+$/.test(releaseNumber)) {
+              try {
+                const { data } = await github.rest.repos.getRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: Number(releaseNumber),
+                });
+                return data;
+              } catch (error) {
+                if (error.status === 404) return undefined;
+                throw error;
+              }
+            }
             // Paginate so we search ALL releases, including drafts
             // (getReleaseByTag does not return draft releases)
             const releases = await github.paginate(github.rest.repos.listReleases, {
@@ -47,7 +53,20 @@ runs:
               repo: context.repo.repo,
               per_page: 100,
             });
-            release = releases.find(r => r.tag_name === releaseNumber);
+            return releases.find(r => r.tag_name === releaseNumber);
+          };
+
+          // The release may not be visible in the API immediately after
+          // creation, so retry with backoff before giving up.
+          let release;
+          const delaysMs = [0, 5000, 10000, 20000, 30000];
+          for (const [attempt, delayMs] of delaysMs.entries()) {
+            if (delayMs > 0) {
+              console.log(`⏳ Release not found yet, retrying in ${delayMs / 1000}s (attempt ${attempt + 1}/${delaysMs.length})...`);
+              await sleep(delayMs);
+            }
+            release = await fetchRelease();
+            if (release) break;
           }
 
           if (!release) {
