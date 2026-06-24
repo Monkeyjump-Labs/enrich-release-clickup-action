@@ -103,7 +103,11 @@ runs:
             for (const comment of comments) {
               const lines = comment.body.split("\n");
               for (const line of lines) {
-                const match = line.match(/^Task linked:\s+\[(.*)\]\((https:\/\/app\.clickup\.com\/t\/[\w\d]+)\)/);
+                // The URL path may be a standard task ID (e.g. /t/868d03kjk) or a
+                // custom ID, which includes a hyphen and a team segment
+                // (e.g. /t/9001234567/SMART-1234). Capture everything up to the
+                // closing paren so both forms are detected.
+                const match = line.match(/^Task linked:\s+\[(.*)\]\((https:\/\/app\.clickup\.com\/t\/[^)\s]+)\)/);
                 if (match) {
                   const label = match[1];  // e.g. "CU-868d03kjk Lease template editor"
                   const url = match[2];
