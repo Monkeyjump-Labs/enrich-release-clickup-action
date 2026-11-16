@@ -9,6 +9,10 @@ inputs:
   release_number:
     description: "Release ID or Tag (e.g. '210470574' or '1.1.205')"
     required: true
+  clickup_team_id:
+    description: 'ClickUp workspace (team) ID. When set, ticket tags such as #SMART-1234 in the release notes are linked as https://app.clickup.com/t/<team_id>/SMART-1234'
+    default: ''
+    required: false
 
 runs:
   using: 'composite'
@@ -23,6 +27,7 @@ runs:
       uses: actions/github-script@v7
       env:
         RELEASE_NUMBER: ${{ inputs.release_number }}
+        CLICKUP_TEAM_ID: ${{ inputs.clickup_team_id }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |
@@ -75,70 +80,151 @@ runs:
           }
 
           // 2) Pull out the body (text) of the release.
-          const body = release.body;
+          const body = release.body || '';
           console.log(`🔍 Processing release: ${release.name} (ID: ${release.id})`);
 
-          // 3) Look for PR links in the existing release notes:
-          //    e.g. "https://github.com/org/repo/pull/123"
-          const prLinkRegex = /https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/g;
-          const prNumbers = [...new Set([...body.matchAll(prLinkRegex)].map(m => parseInt(m[1])))];
+          const teamId = (process.env.CLICKUP_TEAM_ID || '').trim();
+          if (!teamId) {
+            console.log('ℹ️ clickup_team_id not set, so ticket tags like #SMART-1234 will not be linked');
+          }
 
-          console.log(`🧾 Found ${prNumbers.length} unique PR(s): ${prNumbers.join(", ")}`);
+          // 3) Find the bullet lines that link a PR. GitHub's generated notes link
+          //    ".../pull/123"; release-please links the same PR as ".../issues/123".
+          //    The PR link is the last such link on the line (release-please also links
+          //    "#120" mentions in the subject before it), hence the greedy prefix.
+          const prLineRegex = /^([ \t]*)[*-] .*https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/(?:pull|issues)\/(\d+)\b.*$/gm;
+          // Only links into this repository are its PRs; an issue in another repo is not.
+          const isThisRepo = (owner, repo) =>
+            owner.toLowerCase() === context.repo.owner.toLowerCase() &&
+            repo.toLowerCase() === context.repo.repo.toLowerCase();
+          const prNumbers = [
+            ...new Set(
+              [...body.matchAll(prLineRegex)].filter((m) => isThisRepo(m[2], m[3])).map((m) => parseInt(m[4])),
+            ),
+          ];
 
-          // 4) For each PR, grab all the comments, look for lines like:
-          //    "Task linked: [CU-XXXXX My Task](https://app.clickup.com/t/CU-XXXXX)"
+          console.log(`🧾 Found ${prNumbers.length} unique PR(s): ${prNumbers.join(', ')}`);
+
+          // A task is { key, label, url }. The key is the ticket ID when the label starts
+          // with one (SMART-1234, CU-868abc), otherwise the URL, so the same ticket found
+          // twice is listed once.
+          const toTask = (label, url) => {
+            const first = label.trim().split(/\s+/)[0];
+            const key = /^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+$/.test(first) ? first.toUpperCase() : url;
+            return { key, label: label.trim(), url };
+          };
+
+          // 4) For each PR, read every comment and collect the ClickUp tasks it links:
+          //    v1 of enrich-pr-clickup-action writes
+          //      "Task linked: [CU-XXXXX My Task](https://app.clickup.com/t/XXXXX)"
+          //    v2 writes a heading and a field list
+          //      "### 🎟️ SMART-1234 — My Task"
+          //      "- **Ticket**: [SMART-1234](https://app.clickup.com/t/XXXXX)"
+          // The URL path may be a standard task ID (/t/868d03kjk) or a custom ID with a
+          // team segment (/t/9001234567/SMART-1234), so capture up to the closing paren.
+          const taskLinkedRegex = /^Task linked:\s+\[(.*)\]\((https:\/\/app\.clickup\.com\/t\/[^)\s]+)\)/;
+          const ticketFieldRegex = /^\s*[*-]\s+\*\*Ticket\*\*:\s+\[([^\]]+)\]\((https:\/\/app\.clickup\.com\/t\/[^)\s]+)\)/;
+          const ticketHeadingRegex = /^#{1,6}\s+\S+\s+(\S+)\s+—\s+(.+?)\s*$/;
           const prToTasksMap = {};
 
           for (const pr of prNumbers) {
             console.log(`\n➡️ Checking PR #${pr}`);
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: pr
+              issue_number: pr,
+              per_page: 100,
             });
 
             console.log(`💬 Found ${comments.length} comment(s) on PR #${pr}`);
 
             const tasks = [];
             for (const comment of comments) {
-              const lines = comment.body.split("\n");
+              // v2 embeds the ticket's description in a <details> block; ignore it, so
+              // text quoted there can't add tasks or rename this one.
+              const allLines = (comment.body || '').split(/\r?\n/);
+              const detailsAt = allLines.findIndex((l) => /^\s*<details>/i.test(l));
+              const lines = detailsAt === -1 ? allLines : allLines.slice(0, detailsAt);
+              const names = {};
               for (const line of lines) {
-                // The URL path may be a standard task ID (e.g. /t/868d03kjk) or a
-                // custom ID, which includes a hyphen and a team segment
-                // (e.g. /t/9001234567/SMART-1234). Capture everything up to the
-                // closing paren so both forms are detected.
-                const match = line.match(/^Task linked:\s+\[(.*)\]\((https:\/\/app\.clickup\.com\/t\/[^)\s]+)\)/);
-                if (match) {
-                  const label = match[1];  // e.g. "CU-868d03kjk Lease template editor"
-                  const url = match[2];
-                  tasks.push(`  - [${label}](${url})`);
-                  console.log(`🔗 Found ClickUp task: ${label} (${url})`);
+                const heading = line.match(ticketHeadingRegex);
+                if (heading && !names[heading[1]]) names[heading[1]] = heading[2];
+              }
+              for (const line of lines) {
+                const linked = line.match(taskLinkedRegex);
+                const field = line.match(ticketFieldRegex);
+                if (linked) {
+                  tasks.push(toTask(linked[1], linked[2]));
+                } else if (field) {
+                  const id = field[1].trim();
+                  // Escape brackets and backslashes so the name can't end the link text early.
+                  const name = names[id] && names[id].replace(/[\\[\]]/g, '\\$&');
+                  tasks.push(toTask(name ? `${id} ${name}` : id, field[2]));
+                } else {
+                  continue;
                 }
+                const task = tasks[tasks.length - 1];
+                console.log(`🔗 Found ClickUp task: ${task.label} (${task.url})`);
               }
             }
 
             if (tasks.length > 0) {
-              prToTasksMap[pr] = tasks.join("\n");
+              prToTasksMap[pr] = tasks;
               console.log(`✅ Associating ${tasks.length} task(s) with PR #${pr}`);
             } else {
               console.log(`🚫 No task links found in comments for PR #${pr}`);
             }
           }
 
-          // 5) Insert sub-bullets into the release notes
+          // Ticket tags such as #SMART-1234 on the line itself (release-please copies them
+          // from the PR title). They need the team ID to form a custom-ID URL. ClickUp
+          // custom-ID prefixes are upper case, which keeps "#utf-8" and "#step-2" out; the
+          // lookbehind skips URL fragments like "#issuecomment-123".
+          const ticketTagRegex = /(?<![\w/#-])#([A-Z][A-Z0-9]*-\d+)\b/g;
+          const tagTasks = (line) =>
+            teamId
+              ? [...line.matchAll(ticketTagRegex)].map((m) => {
+                  const id = m[1];
+                  return toTask(id, `https://app.clickup.com/t/${encodeURIComponent(teamId)}/${id}`);
+                })
+              : [];
+
+          // 5) Insert sub-bullets into the release notes, under the whole PR line. A task
+          //    found in a PR comment replaces the same ticket's tag link, since the
+          //    comment carries the task's name.
           console.log(`\n🛠 Updating release notes...`);
-          const updatedBody = body.replace(
-            /^(\s*[*-] .+?https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+))/gm,
-            (match, fullLine, prStr) => {
-              const pr = parseInt(prStr);
-              const subBullets = prToTasksMap[pr];
-              if (subBullets) {
-                console.log(`📌 Inserting sub-bullets for PR #${pr}`);
-                return `${fullLine}\n${subBullets}`;
-              }
-              return match;
+          const updatedBody = body.replace(prLineRegex, (line, indent, owner, repo, prStr, offset, whole) => {
+            if (!isThisRepo(owner, repo)) return line;
+            const pr = parseInt(prStr);
+            const merged = new Map();
+            for (const task of [...tagTasks(line), ...(prToTasksMap[pr] || [])]) {
+              // Two IDs (CU-868a, SMART-1) can name the same task URL; list it once.
+              const sameUrl = [...merged.values()].find((t) => t.url === task.url && t.key !== task.key);
+              if (!sameUrl) merged.set(task.key, task);
             }
-          );
+            if (merged.size === 0) return line;
+
+            // A re-run on notes that were already enriched, or edited since (CRLF line
+            // endings after a web-UI edit), adds only the ClickUp links not yet listed
+            // under this line.
+            // A ticket counts as listed when its ID or its URL is, so a tag link from an
+            // earlier run isn't joined by the same ticket's comment link.
+            const existing = [];
+            for (const next of whole.slice(offset + line.length).split(/\r?\n/).slice(1)) {
+              const sub = next.match(/^[ \t]+[*-] \[(.*)\]\((https:\/\/app\.clickup\.com\/t\/[^)\s]+)\)\s*$/);
+              if (!sub || next.length - next.trimStart().length <= indent.length) break;
+              existing.push(toTask(sub[1], sub[2]));
+            }
+            const missing = [...merged.values()].filter(
+              (t) => !existing.some((e) => e.key === t.key || e.url === t.url),
+            );
+            if (missing.length === 0) {
+              console.log(`⏭️ Sub-bullets already present for PR #${pr}`);
+              return line;
+            }
+            console.log(`📌 Inserting ${missing.length} sub-bullet(s) for PR #${pr}`);
+            return `${line}\n${missing.map((t) => `${indent}  - [${t.label}](${t.url})`).join('\n')}`;
+          });
 
           // 6) Only update if there's a change
           if (updatedBody !== body) {
