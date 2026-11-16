@@ -46,4 +46,5 @@ notes) or `.../issues/123` (release-please). Under that line it lists the ClickU
 - `- **Ticket**: [SMART-1234](url)` comment lines on the PR (enrich-pr-clickup-action v2), named from the comment's
   heading.
 
-A ticket found more than once is listed once. Running the action again on notes it already enriched changes nothing.
+A ticket found more than once is listed once. Running the action again on notes it already enriched adds only the
+ClickUp links not yet listed under each line.
