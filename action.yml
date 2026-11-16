@@ -92,8 +92,16 @@ runs:
           //    ".../pull/123"; release-please links the same PR as ".../issues/123".
           //    The PR link is the last such link on the line (release-please also links
           //    "#120" mentions in the subject before it), hence the greedy prefix.
-          const prLineRegex = /^([ \t]*)[*-] .*https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/(?:pull|issues)\/(\d+)\b.*$/gm;
-          const prNumbers = [...new Set([...body.matchAll(prLineRegex)].map((m) => parseInt(m[2])))];
+          const prLineRegex = /^([ \t]*)[*-] .*https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/(?:pull|issues)\/(\d+)\b.*$/gm;
+          // Only links into this repository are its PRs; an issue in another repo is not.
+          const isThisRepo = (owner, repo) =>
+            owner.toLowerCase() === context.repo.owner.toLowerCase() &&
+            repo.toLowerCase() === context.repo.repo.toLowerCase();
+          const prNumbers = [
+            ...new Set(
+              [...body.matchAll(prLineRegex)].filter((m) => isThisRepo(m[2], m[3])).map((m) => parseInt(m[4])),
+            ),
+          ];
 
           console.log(`🧾 Found ${prNumbers.length} unique PR(s): ${prNumbers.join(', ')}`);
 
@@ -185,22 +193,31 @@ runs:
           //    found in a PR comment replaces the same ticket's tag link, since the
           //    comment carries the task's name.
           console.log(`\n🛠 Updating release notes...`);
-          const updatedBody = body.replace(prLineRegex, (line, indent, prStr, offset, whole) => {
+          const updatedBody = body.replace(prLineRegex, (line, indent, owner, repo, prStr, offset, whole) => {
+            if (!isThisRepo(owner, repo)) return line;
             const pr = parseInt(prStr);
             const merged = new Map();
-            for (const task of [...tagTasks(line), ...(prToTasksMap[pr] || [])]) merged.set(task.key, task);
+            for (const task of [...tagTasks(line), ...(prToTasksMap[pr] || [])]) {
+              // Two IDs (CU-868a, SMART-1) can name the same task URL; list it once.
+              const sameUrl = [...merged.values()].find((t) => t.url === task.url && t.key !== task.key);
+              if (!sameUrl) merged.set(task.key, task);
+            }
             if (merged.size === 0) return line;
 
             // A re-run on notes that were already enriched, or edited since (CRLF line
             // endings after a web-UI edit), adds only the ClickUp links not yet listed
             // under this line.
+            // A ticket counts as listed when its ID or its URL is, so a tag link from an
+            // earlier run isn't joined by the same ticket's comment link.
             const existing = [];
             for (const next of whole.slice(offset + line.length).split(/\r?\n/).slice(1)) {
-              const sub = next.match(/^[ \t]+[*-] \[.*\]\((https:\/\/app\.clickup\.com\/t\/[^)\s]+)\)\s*$/);
+              const sub = next.match(/^[ \t]+[*-] \[(.*)\]\((https:\/\/app\.clickup\.com\/t\/[^)\s]+)\)\s*$/);
               if (!sub || next.length - next.trimStart().length <= indent.length) break;
-              existing.push(sub[1]);
+              existing.push(toTask(sub[1], sub[2]));
             }
-            const missing = [...merged.values()].filter((t) => !existing.includes(t.url));
+            const missing = [...merged.values()].filter(
+              (t) => !existing.some((e) => e.key === t.key || e.url === t.url),
+            );
             if (missing.length === 0) {
               console.log(`⏭️ Sub-bullets already present for PR #${pr}`);
               return line;
